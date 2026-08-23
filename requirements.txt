@@ -1,0 +1,7 @@
+streamlit
+google-genai
+pydantic
+scikit-image
+opencv-python-headless
+Pillow
+numpy
