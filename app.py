@@ -1,6 +1,7 @@
 import streamlit as st
 import time
 import os
+import re
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
@@ -59,7 +60,9 @@ class StructuralGeologyAnalysis(BaseModel):
 
 # --- 3. Stage 1: Meijering 脊線濾波與中斷點提取 ---
 def advanced_skeleton_pipeline(pil_image, min_component_length=20):
-    cv_img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    # 強制轉為 RGB 確保通道一致
+    rgb_image = pil_image.convert("RGB")
+    cv_img = cv2.cvtColor(np.array(rgb_image), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape
 
@@ -135,7 +138,7 @@ with st.sidebar:
     dip_max = st.slider("斷層最大合理傾角 (°)", 60, 90, 80)
 
 # --- 6. 主頁面介面 ---
-st.title("🌋 井震合一神經符號 AI 地質大腦")
+st.title("🌋 井震合一神經符號地質大腦")
 st.subheader("Pipeline: Meijering 脊線骨幹 ➔ LLM 空間感知 ➔ 符號幾何驗證 ➔ 綜合評判")
 st.divider()
 
@@ -163,22 +166,28 @@ if submit_button:
     else:
         with st.spinner("⚡ 正在執行神經符號推理流水線..."):
             try:
+                # 初始化 Gemini 客戶端
                 client = genai.Client(api_key=clean_api_key)
 
-                pil_well_img = Image.open(well_img_file) if well_img_file else None
-                well_img_status = f"已附帶鑽井圖檔 ({well_img_file.name})" if well_img_file else "未提供鑽井圖像"
+                # 處理鑽井圖像輸入
+                pil_well_img = None
+                well_img_status = "未提供鑽井圖像"
+                if well_img_file:
+                    pil_well_img = Image.open(well_img_file).convert("RGB")
+                    well_img_status = f"已附帶鑽井圖檔 ({well_img_file.name})"
 
                 for file in seismic_files:
                     st.divider()
                     st.subheader(f"🖼️ 分析目標檔案：{file.name}")
 
-                    pil_seismic_img = Image.open(file)
+                    # 讀取並淨化震測圖像
+                    pil_seismic_img = Image.open(file).convert("RGB")
                     img_w, img_h = pil_seismic_img.size
 
-                    # Stage 1: 提取骨幹與斷點
+                    # Stage 1: Meijering 脊線特徵提煉
                     tracing_img = advanced_skeleton_pipeline(pil_seismic_img, min_component_length=min_comp_len)
 
-                    # Stage 2: 多模態結構化推理 (使用最新 gemini-2.5-flash / gemini-2.0-flash)
+                    # Stage 2: 構建 Prompt 與結構化 Payload
                     prompt = f"""
                     你是一位資深的結構地質學與地球物理專家。
                     我為你提供了一張【骨幹拓撲特徵圖】（黃線為同相軸骨幹，青色圓點為同相軸中斷點 Off-sets）。
@@ -201,43 +210,47 @@ if submit_button:
                         response_schema=StructuralGeologyAnalysis
                     )
 
-                    # 穩健重試機制：僅使用有效的 2.5-flash 與 2.0-flash
-                    active_models = ['gemini-2.5-flash', 'gemini-2.0-flash']
+                    # Stage 2: 呼叫現役 gemini-2.5-flash，並帶有指數退避重試保護
                     response = None
-                    last_error = None
+                    max_retries = 3
+                    target_model = "gemini-2.5-flash"
 
-                    for model_name in active_models:
-                        for attempt in range(3):
-                            try:
-                                response = client.models.generate_content(
-                                    model=model_name,
-                                    contents=contents_payload,
-                                    config=config
-                                )
-                                if response and response.text:
-                                    break
-                            except Exception as err:
-                                last_error = err
-                                if "503" in str(err) or "UNAVAILABLE" in str(err):
-                                    time.sleep(2 * (attempt + 1))
-                                else:
-                                    break
-                        if response and response.text:
-                            break
+                    for attempt in range(max_retries):
+                        try:
+                            response = client.models.generate_content(
+                                model=target_model,
+                                contents=contents_payload,
+                                config=config
+                            )
+                            if response and response.text:
+                                break
+                        except Exception as api_err:
+                            err_msg = str(api_err)
+                            if attempt < max_retries - 1:
+                                wait_sec = (attempt + 1) * 3
+                                st.warning(f"⚠️ API 回應忙碌中，正進行第 {attempt + 1} 次重試（等待 {wait_sec} 秒）...")
+                                time.sleep(wait_sec)
+                            else:
+                                raise RuntimeError(f"Google API 連線異常 ({target_model}): {err_msg}")
 
                     if not response or not response.text:
-                        raise RuntimeError(f"API 呼叫失敗: {str(last_error)}")
+                        raise RuntimeError("模型未回傳有效文字內容。")
 
-                    # 解析結構化結果
-                    structured_result = StructuralGeologyAnalysis.model_validate_json(response.text)
+                    # JSON 清洗與 Pydantic 結構化驗證
+                    raw_json = response.text.strip()
+                    if raw_json.startswith("```json"):
+                        raw_json = re.sub(r"^```json\s*", "", raw_json)
+                        raw_json = re.sub(r"\s*```$", "", raw_json)
+
+                    structured_result = StructuralGeologyAnalysis.model_validate_json(raw_json)
                     pred = structured_result.fault_prediction
 
-                    # Stage 3: 符號層幾何約束
+                    # Stage 3: 符號層幾何物理驗證
                     (rx1, ry1, rx2, ry2), calc_dip, status_msg = symbolic_geometric_verification(
                         pred, img_w, img_h, min_dip=dip_min, max_dip=dip_max
                     )
 
-                    # Stage 4: 疊加斷層線
+                    # Stage 4: 向量疊加斷層線繪製
                     annotated_seismic_img = pil_seismic_img.copy()
                     draw_final = ImageDraw.Draw(annotated_seismic_img)
                     draw_final.line([(rx1, ry1), (rx2, ry2)], fill="red", width=5)
@@ -246,7 +259,7 @@ if submit_button:
                     # 畫面渲染輸出
                     col_img1, col_img2 = st.columns(2)
                     with col_img1:
-                        st.image(tracing_img, caption="Stage 1: Meijering 脊線骨幹與中斷點", use_container_width=True)
+                        st.image(tracing_img, caption="Stage 1: Meijering 脊線骨幹與中斷點 (黃:地層 | 青:斷點)", use_container_width=True)
                     with col_img2:
                         st.image(annotated_seismic_img, caption="Stage 4: 符號層驗證後之斷層疊加圖 (紅線)", use_container_width=True)
 
