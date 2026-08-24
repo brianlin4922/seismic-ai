@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
+from skimage.filters import meijering
 from skimage.morphology import skeletonize
 from skimage.measure import label, regionprops
 
@@ -55,33 +56,31 @@ class StructuralGeologyAnalysis(BaseModel):
     stratigraphy_well_tie_report: str = Field(description="第二節：地層層位追蹤與井震空間對比解釋")
     geological_summary: str = Field(description="第三節：構造綜合總結 (2-3 句話)")
 
-# --- 🎨 Stage 1：層狀同相軸定向形態學骨幹提取 ---
-def advanced_skeleton_pipeline(pil_image, min_component_length=30):
+# --- 🎨 Stage 1：Meijering 脊線濾波提取獨立地層骨幹 ---
+def advanced_skeleton_pipeline(pil_image, min_component_length=20):
     cv_img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape
 
-    # 1. 僅沿水平向進行非等向平滑（保留垂直方向的層狀間隔，防止上下層黏合）
-    smooth = cv2.GaussianBlur(gray, (9, 3), 0)
+    # 1. 灰階反轉：震測圖黑色同相軸轉為高能量脊線
+    inverted = cv2.bitwise_not(gray)
 
-    # 2. 方向性黑帽轉換 (Black-Hat Transform)：專門擷取黑色粗同相軸波谷
-    kernel_horiz = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-    blackhat = cv2.morphologyEx(smooth, cv2.MORPH_BLACKHAT, kernel_horiz)
+    # 2. 中值濾波抑制椒鹽雜訊
+    denoised = cv2.medianBlur(inverted, 3)
 
-    # 3. Otsu 自適應閾值二值化
-    _, binary = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 3. Meijering 脊線濾波器捕捉地層中心線，消除垂直黏合
+    ridges = meijering(denoised, sigmas=range(1, 4, 1), black_ridges=False)
 
-    # 4. 水平開運算：切斷上下地層相連的垂直雜訊毛刺
-    kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1))
-    separated_binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean)
+    # 4. 二值化核心脊線響應
+    thresh_val = np.percentile(ridges[ridges > 0], 65) if np.any(ridges > 0) else 0.1
+    binary_ridges = ridges > thresh_val
 
     # 5. 拓撲骨幹化
-    bool_skeleton = skeletonize(separated_binary > 0)
-    skeleton = (bool_skeleton * 255).astype(np.uint8)
+    skeleton = skeletonize(binary_ridges)
 
-    # 6. 連通元件長度過濾：僅保留足夠長的水平層狀反射軸
-    labeled_img = label(skeleton > 0)
-    cleaned_skeleton = np.zeros_like(skeleton)
+    # 6. 連通元件長度過濾
+    labeled_img = label(skeleton)
+    cleaned_skeleton = np.zeros_like(skeleton, dtype=np.uint8)
 
     for prop in regionprops(labeled_img):
         if prop.major_axis_length >= min_component_length:
@@ -92,24 +91,22 @@ def advanced_skeleton_pipeline(pil_image, min_component_length=30):
     filtered = cv2.filter2D(cleaned_skeleton // 255, -1, kernel_endpoints)
     endpoints_mask = (filtered == 11)
 
-    # 繪製乾淨的描圖紙特徵圖
+    # 8. 繪製特徵圖 (深色底、黃色地層骨幹、青色中斷點)
     tracing_img = Image.new("RGB", (width, height), (20, 20, 20))
     draw = ImageDraw.Draw(tracing_img)
 
-    # 黃色：分層清晰的同相軸骨幹
     y_idxs, x_idxs = np.where(cleaned_skeleton > 0)
     for x, y in zip(x_idxs, y_idxs):
         draw.point((x, y), fill=(255, 215, 0))
 
-    # 青色圓圈：同相軸中斷點 (排除圖緣雜訊)
     ey_idxs, ex_idxs = np.where(endpoints_mask)
     for ex, ey in zip(ex_idxs, ey_idxs):
-        if width * 0.05 < ex < width * 0.95 and height * 0.05 < ey < height * 0.95:
-            draw.ellipse([ex-3, ey-3, ex+3, ey+3], fill=(0, 255, 255))
+        if width * 0.03 < ex < width * 0.97 and height * 0.03 < ey < height * 0.97:
+            draw.ellipse([ex-2, ey-2, ex+2, ey+2], fill=(0, 255, 255))
 
     return tracing_img
 
-# --- ⚖️ Stage 3：符號幾何驗證層 (Symbolic Verification Layer) ---
+# --- ⚖️ Stage 3：符號幾何驗證層 ---
 def symbolic_geometric_verification(coord: FaultCoordinate, img_w, img_h, min_dip=20.0, max_dip=85.0):
     x1 = int(np.clip((coord.x1 / 1000.0) * img_w, 0, img_w))
     y1 = int(np.clip((coord.y1 / 1000.0) * img_h, 0, img_h))
@@ -136,13 +133,13 @@ with st.sidebar:
     api_key_input = st.text_input("輸入 Google API Key", value=env_key, type="password", placeholder="AIzaSy...")
     st.divider()
     st.header("⚙️ 符號層地質約束參數")
-    min_comp_len = st.slider("同相軸骨幹過濾長度 (px)", 10, 80, 30)
+    min_comp_len = st.slider("同相軸骨幹過濾長度 (px)", 5, 60, 20)
     dip_min = st.slider("斷層最小合理傾角 (°)", 10, 45, 20)
     dip_max = st.slider("斷層最大合理傾角 (°)", 60, 90, 80)
 
 # --- 主畫面標題 ---
 st.title("🌋 井震合一神經符號 AI 地質大腦 (6.0 符號驗證版)")
-st.subheader("完整 Pipeline：CV 骨幹拓撲 ➔ LLM 結構化感知 ➔ 符號幾何驗證 ➔ 綜合評判")
+st.subheader("完整 Pipeline：Meijering 脊線骨幹 ➔ LLM 結構化感知 ➔ 符號幾何驗證 ➔ 綜合評判")
 st.divider()
 
 # --- 📥 輸入區塊 ---
@@ -198,10 +195,10 @@ if submit_button:
                     pil_seismic_img = Image.open(file)
                     img_w, img_h = pil_seismic_img.size
 
-                    # --- Stage 1: 方向性骨幹提取 ---
+                    # --- Stage 1: Meijering 脊線骨幹提取 ---
                     tracing_img = advanced_skeleton_pipeline(pil_seismic_img, min_component_length=min_comp_len)
 
-                    # --- Stage 2: Gemini 結構化輸出 ---
+                    # --- Stage 2: Gemini 結構化輸出 (含 503 重試與備援) ---
                     prompt = f"""
                     你是一位資深的結構地質學與地球物理專家。
                     我為你提供了一張【骨幹拓撲特徵圖】（黃線為分層清晰的同相軸骨幹，青色圓點為同相軸中斷點 Off-sets）。
@@ -224,11 +221,30 @@ if submit_button:
                         response_schema=StructuralGeologyAnalysis
                     )
 
-                    response = client.models.generate_content(
-                        model='gemini-2.5-flash',
-                        contents=contents_payload,
-                        config=config
-                    )
+                    candidate_models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+                    response = None
+                    last_err = None
+
+                    for model_name in candidate_models:
+                        for attempt in range(3):
+                            try:
+                                response = client.models.generate_content(
+                                    model=model_name,
+                                    contents=contents_payload,
+                                    config=config
+                                )
+                                break
+                            except Exception as api_err:
+                                last_err = api_err
+                                if "503" in str(api_err) or "UNAVAILABLE" in str(api_err):
+                                    time.sleep(2 * (attempt + 1))
+                                else:
+                                    break
+                        if response:
+                            break
+
+                    if not response:
+                        raise last_err
 
                     # 解析結構化物件
                     structured_result = StructuralGeologyAnalysis.model_validate_json(response.text)
@@ -247,9 +263,9 @@ if submit_button:
 
                     col_img1, col_img2 = st.columns(2)
                     with col_img1:
-                        st.image(tracing_img, caption=f"Stage 1: 拓撲骨幹與中斷點 (黃:骨幹 | 青:斷點)", use_container_width=True)
+                        st.image(tracing_img, caption="Stage 1: Meijering 脊線骨幹與中斷點 (黃:地層線 | 青:錯斷點)", use_container_width=True)
                     with col_img2:
-                        st.image(annotated_seismic_img, caption=f"Stage 4: 符號層驗證後之斷層疊加圖 (紅線)", use_container_width=True)
+                        st.image(annotated_seismic_img, caption="Stage 4: 符號層驗證後之斷層疊加圖 (紅線)", use_container_width=True)
 
                     st.markdown(f'<div class="status-box">🛡️ <b>符號幾何驗證層 (Symbolic Layer) 狀態：</b><br>{status_msg}</div>', unsafe_allow_html=True)
 
