@@ -11,7 +11,7 @@ from skimage.measure import label, regionprops
 
 # --- 網頁全寬與行動端優化 ---
 st.set_page_config(
-    page_title="井震合一神經符號 AI 系統 (Neuro-Symbolic 6.0)",
+    page_title="ｎｅｗ井震合一神經符號 AI 系統 (Neuro-Symbolic 6.0)",
     page_icon="🌋",
     layout="wide",
     initial_sidebar_state="expanded"
